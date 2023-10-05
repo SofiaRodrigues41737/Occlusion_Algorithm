@@ -1,0 +1,236 @@
+import math
+import os
+import zipfile
+from typing import Optional, Callable, Tuple, Any
+
+import numpy as np
+import torch
+from PIL import ImageDraw, Image, ImageColor
+from kaggle import KaggleApi
+from torch.utils.data import Dataset
+from torch_mtcnn.box_utils import nms, convert_to_square, calibrate_box, get_image_boxes
+from torch_mtcnn.first_stage import run_first_stage
+from torch_mtcnn.get_nets import PNet, RNet, ONet
+from torchvision.transforms import transforms
+
+def detect_faces(image, min_face_size=20.0,
+                 thresholds=[0.6, 0.7, 0.8],
+                 nms_thresholds=[0.7, 0.7, 0.7]):
+    """
+    Arguments:
+        image: an instance of PIL.Image.
+        min_face_size: a float number.
+        thresholds: a list of length 3.
+        nms_thresholds: a list of length 3.
+
+    Returns:
+        two float numpy arrays of shapes [n_boxes, 4] and [n_boxes, 10],
+        bounding boxes and facial landmarks.
+    """
+
+    # LOAD MODELS
+    pnet = PNet()
+    rnet = RNet()
+    onet = ONet()
+    onet.eval()
+
+    # BUILD AN IMAGE PYRAMID
+    width, height = image.size
+    min_length = min(height, width)
+
+    min_detection_size = 12
+    factor = 0.707  # sqrt(0.5)
+
+    # scales for scaling the image
+    scales = []
+
+    # scales the image so that
+    # minimum size that we can detect equals to
+    # minimum face size that we want to detect
+    m = min_detection_size / min_face_size
+    min_length *= m
+
+    factor_count = 0
+    while min_length > min_detection_size:
+        scales.append(m * factor ** factor_count)
+        min_length *= factor
+        factor_count += 1
+
+    # STAGE 1
+
+    # it will be returned
+    bounding_boxes = []
+
+    # run P-Net on different scales
+    for s in scales:
+        boxes = run_first_stage(image, pnet, scale=s, threshold=thresholds[0])
+        bounding_boxes.append(boxes)
+
+    # collect boxes (and offsets, and scores) from different scales
+    bounding_boxes = [i for i in bounding_boxes if i is not None]
+    if len(bounding_boxes) == 0:
+        bounding_boxes.append([0, 0, 0, 0, 0, 0, 0, 0, 0])
+    bounding_boxes = np.vstack(bounding_boxes)
+
+    keep = nms(bounding_boxes[:, 0:5], nms_thresholds[0])
+    bounding_boxes = bounding_boxes[keep]
+
+    # use offsets predicted by pnet to transform bounding boxes
+    bounding_boxes = calibrate_box(bounding_boxes[:, 0:5], bounding_boxes[:, 5:])
+    # shape [n_boxes, 5]
+
+    bounding_boxes = convert_to_square(bounding_boxes)
+    bounding_boxes[:, 0:4] = np.round(bounding_boxes[:, 0:4])
+
+    # STAGE 2
+
+    with torch.no_grad():
+
+        img_boxes = get_image_boxes(bounding_boxes, image, size=24)
+        img_boxes = torch.FloatTensor(img_boxes)
+        output = rnet(img_boxes)
+        offsets = output[0].data.cpu().numpy()  # shape [n_boxes, 4]
+        probs = output[1].data.cpu().numpy()  # shape [n_boxes, 2]
+
+        keep = np.where(probs[:, 1] > thresholds[1])[0]
+        bounding_boxes = bounding_boxes[keep]
+        bounding_boxes[:, 4] = probs[keep, 1].reshape((-1,))
+        offsets = offsets[keep]
+
+        keep = nms(bounding_boxes, nms_thresholds[1])
+        bounding_boxes = bounding_boxes[keep]
+        bounding_boxes = calibrate_box(bounding_boxes, offsets[keep])
+        bounding_boxes = convert_to_square(bounding_boxes)
+        bounding_boxes[:, 0:4] = np.round(bounding_boxes[:, 0:4])
+
+        # STAGE 3
+
+        img_boxes = get_image_boxes(bounding_boxes, image, size=48)
+        if len(img_boxes) == 0:
+            return [], []
+        img_boxes = torch.FloatTensor(img_boxes)
+        output = onet(img_boxes)
+        landmarks = output[0].data.cpu().numpy()  # shape [n_boxes, 10]
+        offsets = output[1].data.cpu().numpy()  # shape [n_boxes, 4]
+        probs = output[2].data.cpu().numpy()  # shape [n_boxes, 2]
+
+        keep = np.where(probs[:, 1] > thresholds[2])[0]
+        bounding_boxes = bounding_boxes[keep]
+        bounding_boxes[:, 4] = probs[keep, 1].reshape((-1,))
+        offsets = offsets[keep]
+        landmarks = landmarks[keep]
+
+    # compute landmark points
+    width = bounding_boxes[:, 2] - bounding_boxes[:, 0] + 1.0
+    height = bounding_boxes[:, 3] - bounding_boxes[:, 1] + 1.0
+    xmin, ymin = bounding_boxes[:, 0], bounding_boxes[:, 1]
+    landmarks[:, 0:5] = np.expand_dims(xmin, 1) + np.expand_dims(width, 1) * landmarks[:, 0:5]
+    landmarks[:, 5:10] = np.expand_dims(ymin, 1) + np.expand_dims(height, 1) * landmarks[:, 5:10]
+
+    bounding_boxes = calibrate_box(bounding_boxes, offsets)
+    keep = nms(bounding_boxes, nms_thresholds[2], mode='min')
+    bounding_boxes = bounding_boxes[keep]
+    landmarks = landmarks[keep]
+
+    return bounding_boxes, landmarks
+
+
+def show_bboxes(img, bounding_boxes, facial_landmarks=[]):
+    """Draw bounding boxes and facial landmarks.
+
+    Arguments:
+        img: an instance of PIL.Image.
+        bounding_boxes: a float numpy array of shape [n, 5].
+        facial_landmarks: a float numpy array of shape [n, 10].
+
+    Returns:
+        an instance of PIL.Image.
+    """
+
+    img_copy = img.copy()
+    draw = ImageDraw.Draw(img_copy)
+
+    for b in bounding_boxes:
+        draw.rectangle([
+            (b[0], b[1]), (b[2], b[3])
+        ], outline='white')
+
+    for p in facial_landmarks:
+        for i in range(5):
+            draw.ellipse([
+                (p[i] - 5.0, p[i + 5] - 5.0),
+                (p[i] + 5.0, p[i + 5] + 5.0)
+            ], fill=True,
+                outline='blue')
+
+    return img_copy
+
+
+class CropFaceTransform(object):
+    def __call__(self, sample):
+        bounding_boxes, landmarks = detect_faces(sample)
+        il_image = show_bboxes(sample, bounding_boxes=bounding_boxes, facial_landmarks=landmarks)
+        if len(bounding_boxes) > 0:
+            crop_box = bounding_boxes[0][:-1]
+            sample = il_image.crop(crop_box)
+        return sample
+
+
+class GogglesTransform(object):
+    def __call__(self, sample):
+        bounding_boxes, landmarks = detect_faces(sample)
+        if len(landmarks) == 0:
+            return sample
+        left_eye_x = landmarks[0][0]
+        left_eye_y = landmarks[0][5]
+        right_eye_x = landmarks[0][1]
+        right_eye_y = landmarks[0][6]
+        nose_x = landmarks[0][2]
+        nose_y = landmarks[0][7]
+        middle_eyes_x = (right_eye_x + left_eye_x) / 2
+        middle_eyes_y = (right_eye_y + left_eye_y) / 2
+        googles_width = 2.2 * math.sqrt((right_eye_y - left_eye_y) ** 2 + (right_eye_x - left_eye_x) ** 2)
+        googles_height = 1.5 * math.sqrt((middle_eyes_y - nose_y) ** 2 + (middle_eyes_x - nose_x) ** 2)
+        rectangle = Image.new("RGBA", (int(googles_width), int(googles_height)), color=ImageColor.getrgb("LightGray"))
+        middle_rectangle_x,middle_rectangle_y = googles_width / 2, googles_height/2
+        angle = (right_eye_y - left_eye_y) / (right_eye_x - left_eye_x) * 180 / math.pi
+        rectangle = rectangle.rotate(-angle, expand=True, center=(middle_rectangle_x, middle_rectangle_y))
+        final_size = rectangle.size
+        sample.paste(rectangle, (int(middle_eyes_x - final_size[0]/2), int(middle_eyes_y - final_size[1]/2)), rectangle)
+        return sample
+
+data_transforms = {
+    'train': transforms.Compose([
+        # transforms.RandomResizedCrop(224),
+        # transforms.RandomHorizontalFlip(),
+        transforms.Resize(224),
+        transforms.ToTensor(),
+        # transforms.Lambda(lambda x: x.repeat(3, 1, 1)),
+        # transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ]),
+    'val': transforms.Compose([
+        transforms.Resize(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ]),
+    'run': transforms.Compose([
+        CropFaceTransform(),
+        transforms.Resize(224)
+    ]),
+    'run_goggles': transforms.Compose([
+        CropFaceTransform(),
+        GogglesTransform(),
+        transforms.Resize(224)
+    ]),
+    'train_goggles': transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ]),
+    'goggles': transforms.Compose([
+        # transforms.ToTensor(),
+        # transforms.Lambda(lambda x: x.repeat(3, 1, 1)),
+        # transforms.ToPILImage(),
+        GogglesTransform(),
+        transforms.Resize((224,224))
+    ])
+}
